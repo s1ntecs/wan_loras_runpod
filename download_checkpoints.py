@@ -3,6 +3,8 @@ import os
 import torch
 import numpy as np
 from diffusers import AutoencoderKLWan, WanImageToVideoPipeline
+from huggingface_hub import snapshot_download
+
 from transformers import CLIPVisionModel
 
 from huggingface_hub import hf_hub_download
@@ -11,6 +13,15 @@ from  styles import STYLE_URLS_UNIQUE
 
 
 model_id = "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers"
+
+def download_model():
+    if not os.path.exists("./models"):
+        os.makedirs("./models")
+    print("Downloading model...")
+    snapshot_download(
+        repo_id="Wan-AI/Wan2.1-I2V-14B-480P-Diffusers",
+        cache_dir="./hf_cache"
+    )
 
 def download_wan():
     image_encoder = CLIPVisionModel.from_pretrained(
@@ -44,4 +55,5 @@ def download_loras():
 
 if __name__ == "__main__":
     download_loras()
-    download_wan() 
+    # download_wan() 
+    download_model()

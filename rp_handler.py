@@ -29,6 +29,7 @@ from styles import STYLE_URLS, STYLE_NAMES  # ваши словари
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 model_id = "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers"
+cache = "./hf_cache"
 MODEL_FRAME_RATE = 16
 
 # Будем хранить текущий активный стиль и путь
@@ -49,14 +50,20 @@ class Predictor():
         """
         try:
             self.image_encoder = CLIPVisionModel.from_pretrained(
-                model_id, subfolder="image_encoder", torch_dtype=torch.float32
+                model_id,
+                subfolder="image_encoder",
+                cache_dir=cache,
+                torch_dtype=torch.float32
             )
             self.vae = AutoencoderKLWan.from_pretrained(
-                model_id, subfolder="vae", torch_dtype=torch.float32
+                model_id, subfolder="vae",
+                cache_dir=cache,
+                torch_dtype=torch.float32
             )
             self.pipe = WanImageToVideoPipeline.from_pretrained(
                 model_id,
                 vae=self.vae,
+                cache_dir=cache,
                 image_encoder=self.image_encoder,
                 torch_dtype=torch.bfloat16
             ).to(device)
