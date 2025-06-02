@@ -10,7 +10,7 @@ STYLE_NAMES = {
     "samurai_video": "samurai_50_epochs.safetensors",
     "vip_video": "vip_50_epochs.safetensors",
     "flying_video": "flyingEffect.safetensors",
-    "plush_video": "Wan-I2V LoRA - Morphing Into Plushtoy (Trigger) - Skyreels V2 i2v trained .safetensors",
+    "plush_video": "Morphing.safetensors",
     "squish_video": "squish_18.safetensors",
     "to_sand_video": "wan_disintegrate_e141.safetensors",
     "dance_video": "phut_hon_dance_dabaichui.safetensors",
