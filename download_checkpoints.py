@@ -7,7 +7,7 @@ from transformers import CLIPVisionModel
 
 from huggingface_hub import hf_hub_download
 
-from  styles import STYLE_URLS
+from  styles import STYLE_URLS_UNIQUE
 
 
 model_id = "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers"
@@ -23,7 +23,7 @@ def download_wan():
 
 def download_loras():
     downloaded_paths = []
-    for key, lora_url in STYLE_URLS.items():
+    for key, lora_url in STYLE_URLS_UNIQUE.items():
         try:
             parts = lora_url.split("/")
             repo_id = "/".join(parts[3:5])
