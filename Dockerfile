@@ -1,16 +1,39 @@
 FROM runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04
 
 WORKDIR /
+RUN apt-get update && \
+    apt upgrade -y && \
+    apt-get install -y ffmpeg libgl1-mesa-glx libglib2.0-0 && \
+    rm -rf /var/lib/apt/lists/*
+
 COPY . .
-RUN pip install -r requirements.txt
+RUN pip install torch==2.4.0 \
+    torchvision \
+    git+https://github.com/huggingface/diffusers.git@refs/pull/11059/head \
+    transformers==4.46.2 \
+    accelerate==1.4.0 \
+    huggingface-hub==0.29.1 \
+    requests==2.32.3 \
+    "numpy<2" \
+    ftfy \
+    peft \
+    regex \
+    "pillow>=10.0.0" \
+    "imageio>=2.31.1" \
+    "imageio-ffmpeg>=0.4.8"
 RUN pip install "huggingface_hub[cli]"
+
+# Скачиваем pget (аналог run: curl ... из cog)
+RUN curl -o /usr/local/bin/pget -L "https://github.com/replicate/pget/releases/download/v0.8.2/pget_linux_x86_64" && chmod +x /usr/local/bin/pget
+
+
 # Create model directory
-RUN mkdir -p /runpod-volume/
 
-# Download the large model (this is the time-consuming step)
-RUN huggingface-cli download Wan-AI/Wan2.1-I2V-14B-480P --local-dir /runpod-volume/Wan2.1-I2V-14B-480P
+RUN if [ ! -d "loras" ]; then mkdir loras; fi
 
-COPY rp_handler.py /
+RUN python3 download_checkpoints.py
+
+COPY --chmod=755 start_standalone.sh /start.sh
 
 # Start the container
-CMD ["python3", "-u", "rp_handler.py"]
+ENTRYPOINT /start.sh
