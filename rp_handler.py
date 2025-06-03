@@ -260,8 +260,6 @@ class Predictor():
 #  RunPod Handler
 # -------------------------------------------------------------
 logger = RunPodLogger()
-predictor = Predictor()
-predictor.setup()
 
 
 def handler(job):
