@@ -261,6 +261,12 @@ class Predictor():
 # -------------------------------------------------------------
 logger = RunPodLogger()
 
+if torch.cuda.is_available():
+    print("Current CUDA device:", torch.cuda.current_device())
+    print("Device name:", torch.cuda.get_device_name(torch.cuda.current_device()))
+    predictor = Predictor()
+    predictor.setup()
+
 
 def handler(job):
     global predictor
