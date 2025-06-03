@@ -20,7 +20,9 @@ RUN pip install torch==2.4.0 \
     regex \
     "pillow>=10.0.0" \
     "imageio>=2.31.1" \
-    "imageio-ffmpeg>=0.4.8"
+    "imageio-ffmpeg>=0.4.8" \
+    runpod
+    
 RUN pip install "huggingface_hub[cli]"
 
 # Скачиваем pget (аналог run: curl ... из cog)
