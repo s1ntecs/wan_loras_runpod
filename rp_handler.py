@@ -2,6 +2,7 @@ import os
 import base64
 import time
 import traceback
+from typing import Optional
 import uuid
 import torch
 import tempfile
@@ -169,19 +170,74 @@ class Predictor():
         # Обновляем глобальное состояние
         CURRENT_LORA_NAME = local_path
 
+    def set_fast_mode(self, fast_mode: str):
+        """
+        Переключает флаги ускорения в self.pipe в зависимости от fast_mode.
+        Поддерживаем 3 режима: "Off", "Balanced", "Fast".
+        """
+        # Всегда сначала сбрасываем все ускорения:
+        try:
+            self.pipe.disable_attention_slicing()
+        except Exception:
+            pass
+        try:
+            self.pipe.disable_vae_slicing()
+        except Exception:
+            pass
+        try:
+            self.pipe.disable_xformers_memory_efficient_attention()
+        except Exception:
+            pass
+
+        if fast_mode == "Off":
+            # Никаких оптимизаций: всё как есть
+            return
+
+        # --- Режим Balanced: включаем базовые слайсинги
+        if fast_mode == "Balanced":
+            try:
+                self.pipe.enable_attention_slicing()
+            except Exception:
+                pass
+            try:
+                self.pipe.enable_vae_slicing()
+            except Exception:
+                pass
+            return
+
+        # --- Режим Fast: включаем всё сразу (attention slicing + VAE slicing + xformers, если доступно)
+        if fast_mode == "Fast":
+            try:
+                self.pipe.enable_attention_slicing()
+            except Exception:
+                pass
+            try:
+                self.pipe.enable_vae_slicing()
+            except Exception:
+                pass
+            try:
+                self.pipe.enable_xformers_memory_efficient_attention()
+            except Exception:
+                pass
+            return
+
+        # Если передана неизвестная строка — оставляем Off
+        return
+
     def predict(
         self,
         image: str,
         prompt: str,
         negative_prompt: str = "low quality, bad quality, blurry, pixelated, watermark",
-        lora_style: str = None,
+        lora_style: Optional[str] = None,
         lora_strength: float = 1.0,
         duration: float = 3.0,
         fps: int = 16,
         guidance_scale: float = 5.0,
         num_inference_steps: int = 28,
         resize_mode: str = "auto",
-        seed: int = None
+        seed: Optional[int] = None,
+        fast_mode: str = "Balanced"
     ) -> str:
         """
         Запускаем генерацию видео и возвращаем Base64.
@@ -193,6 +249,7 @@ class Predictor():
         # 2) Рассчитываем количество кадров
         num_frames = calculate_frames(duration, MODEL_FRAME_RATE)
 
+        self.set_fast_mode(fast_mode)
         # 3) Собираем генератор
         if seed is not None:
             torch.manual_seed(seed)
@@ -287,6 +344,7 @@ def handler(job):
         num_inference_steps = payload.get("num_inference_steps", 28)
         resize_mode         = payload.get("resize_mode", "auto")
         seed                = payload.get("seed", None)
+        fast_mode = payload.get("fast_mode", "Balanced")
 
         video_b64 = predictor.predict(
             image=image_path,
@@ -299,7 +357,8 @@ def handler(job):
             guidance_scale=guidance_scale,
             num_inference_steps=num_inference_steps,
             resize_mode=resize_mode,
-            seed=seed
+            seed=seed,
+            fast_mode=fast_mode
         )
 
         return {"video_base64": video_b64}
