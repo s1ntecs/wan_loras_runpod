@@ -2,6 +2,7 @@ import os
 import base64
 import time
 import traceback
+from typing import Optional
 import uuid
 import torch
 import tempfile
@@ -169,19 +170,74 @@ class Predictor():
         # Обновляем глобальное состояние
         CURRENT_LORA_NAME = local_path
 
+    def set_fast_mode(self, fast_mode: str):
+        """
+        Переключает флаги ускорения в self.pipe в зависимости от fast_mode.
+        Поддерживаем 3 режима: "Off", "Balanced", "Fast".
+        """
+        # Всегда сначала сбрасываем все ускорения:
+        try:
+            self.pipe.disable_attention_slicing()
+        except Exception:
+            pass
+        try:
+            self.pipe.disable_vae_slicing()
+        except Exception:
+            pass
+        try:
+            self.pipe.disable_xformers_memory_efficient_attention()
+        except Exception:
+            pass
+
+        if fast_mode == "Off":
+            # Никаких оптимизаций: всё как есть
+            return
+
+        # --- Режим Balanced: включаем базовые слайсинги
+        if fast_mode == "Balanced":
+            try:
+                self.pipe.enable_attention_slicing()
+            except Exception:
+                pass
+            try:
+                self.pipe.enable_vae_slicing()
+            except Exception:
+                pass
+            return
+
+        # --- Режим Fast: включаем всё сразу (attention slicing + VAE slicing + xformers, если доступно)
+        if fast_mode == "Fast":
+            try:
+                self.pipe.enable_attention_slicing()
+            except Exception:
+                pass
+            try:
+                self.pipe.enable_vae_slicing()
+            except Exception:
+                pass
+            try:
+                self.pipe.enable_xformers_memory_efficient_attention()
+            except Exception:
+                pass
+            return
+
+        # Если передана неизвестная строка — оставляем Off
+        return
+
     def predict(
         self,
         image: str,
         prompt: str,
         negative_prompt: str = "low quality, bad quality, blurry, pixelated, watermark",
-        lora_style: str = None,
+        lora_style: Optional[str] = None,
         lora_strength: float = 1.0,
         duration: float = 3.0,
         fps: int = 16,
         guidance_scale: float = 5.0,
         num_inference_steps: int = 28,
         resize_mode: str = "auto",
-        seed: int = None
+        seed: Optional[int] = None,
+        fast_mode: str = "Balanced"
     ) -> str:
         """
         Запускаем генерацию видео и возвращаем Base64.
@@ -193,6 +249,7 @@ class Predictor():
         # 2) Рассчитываем количество кадров
         num_frames = calculate_frames(duration, MODEL_FRAME_RATE)
 
+        self.set_fast_mode(fast_mode)
         # 3) Собираем генератор
         if seed is not None:
             torch.manual_seed(seed)
@@ -291,6 +348,7 @@ def handler(job):
         num_inference_steps = payload.get("num_inference_steps", 28)
         resize_mode         = payload.get("resize_mode", "auto")
         seed                = payload.get("seed", None)
+        fast_mode = payload.get("fast_mode", "Balanced")
 
         video_b64 = predictor.predict(
             image=image_path,
@@ -303,7 +361,8 @@ def handler(job):
             guidance_scale=guidance_scale,
             num_inference_steps=num_inference_steps,
             resize_mode=resize_mode,
-            seed=seed
+            seed=seed,
+            fast_mode=fast_mode
         )
 
         return {"video_base64": video_b64}
@@ -320,3 +379,37 @@ def handler(job):
 if __name__ == "__main__":
     runpod.serverless.start({"handler": handler})
 
+
+
+
+
+#  0%|          | 0/28 [00:00<?, ?it/s]
+#   4%|▎         | 1/28 [00:16<07:22, 16.38s/it]
+#   7%|▋         | 2/28 [00:26<05:36, 12.95s/it]
+#  11%|█         | 3/28 [00:37<04:56, 11.86s/it]
+#  14%|█▍        | 4/28 [00:48<04:32, 11.35s/it]
+#  18%|█▊        | 5/28 [00:58<04:14, 11.08s/it]
+#  21%|██▏       | 6/28 [01:09<04:00, 10.92s/it]
+#  25%|██▌       | 7/28 [01:19<03:47, 10.82s/it]
+#  29%|██▊       | 8/28 [01:30<03:35, 10.76s/it]
+#  32%|███▏      | 9/28 [01:41<03:23, 10.72s/it]
+#  36%|███▌      | 10/28 [01:51<03:12, 10.69s/it]
+#  39%|███▉      | 11/28 [02:02<03:01, 10.68s/it]
+#  43%|████▎     | 12/28 [02:13<02:50, 10.66s/it]
+#  46%|████▋     | 13/28 [02:23<02:39, 10.65s/it]
+#  50%|█████     | 14/28 [02:34<02:29, 10.65s/it]
+#  54%|█████▎    | 15/28 [02:44<02:18, 10.64s/it]
+#  57%|█████▋    | 16/28 [02:55<02:07, 10.64s/it]
+#  61%|██████    | 17/28 [03:06<01:57, 10.64s/it]
+#  64%|██████▍   | 18/28 [03:16<01:46, 10.64s/it]
+#  68%|██████▊   | 19/28 [03:27<01:35, 10.64s/it]
+#  71%|███████▏  | 20/28 [03:38<01:25, 10.64s/it]
+#  75%|███████▌  | 21/28 [03:48<01:14, 10.64s/it]
+#  79%|███████▊  | 22/28 [03:59<01:03, 10.64s/it]
+#  82%|████████▏ | 23/28 [04:10<00:53, 10.64s/it]
+#  86%|████████▌ | 24/28 [04:20<00:42, 10.64s/it]
+#  89%|████████▉ | 25/28 [04:31<00:31, 10.64s/it]
+#  93%|█████████▎| 26/28 [04:41<00:21, 10.64s/it]
+#  96%|█████████▋| 27/28 [04:52<00:10, 10.63s/it]
+# 100%|██████████| 28/28 [05:03<00:00, 10.64s/it]
+# 100%|██████████| 28/28 [05:03<00:00, 10.83s/it]
