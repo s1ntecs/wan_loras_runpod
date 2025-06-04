@@ -11,6 +11,7 @@ RUN pip install torch==2.4.0 \
     torchvision \
     git+https://github.com/huggingface/diffusers.git@refs/pull/11059/head \
     transformers==4.46.2 \
+    tokenizers>=0.20.3 \ 
     accelerate==1.4.0 \
     huggingface-hub==0.29.1 \
     requests==2.32.3 \
@@ -21,8 +22,15 @@ RUN pip install torch==2.4.0 \
     "pillow>=10.0.0" \
     "imageio>=2.31.1" \
     "imageio-ffmpeg>=0.4.8" \
+    opencv-python>=4.9.0.80 \
+    tqdm \
+    easydict \
+    gradio>=5.0.0 \
     runpod \
-    xformers
+    xformers \
+    dashscope \
+    flash_attn \
+    numpy
 
 RUN pip install "huggingface_hub[cli]"
 

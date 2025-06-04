@@ -1,415 +1,356 @@
-import os
-import base64
-import time
-import traceback
-from typing import Optional
-import uuid
-import torch
-import tempfile
-import requests
-import numpy as np
+###############################################################################
+# RunPod handler for Wan2.1-I2V-14B + TeaCache                             #
+#                                                                           #
+# • Поддержка пресетов качества: fast / normal / best                       #
+# • Без LoRA и Diffusers — чистый Wan SDK                                   #
+# • TeaCache патч берётся из официального TeaCache4Wan2.1                   #
+# • Возвращает base64-MP4                                                   #
+###############################################################################
 
-from diffusers import AutoencoderKLWan, WanImageToVideoPipeline
-from diffusers.utils import export_to_video, load_image
-from transformers import CLIPVisionModel
-from huggingface_hub import hf_hub_download
+from __future__ import annotations
+
+import os, uuid, base64, tempfile, traceback, math, random, gc
+from contextlib import contextmanager
+from typing import Literal
+
+import torch
+import numpy as np
+from PIL import Image
+import torchvision.transforms.functional as TF
+import torch.cuda.amp as amp
+from tqdm import tqdm
+
+import wan
+from wan.src.wan.configs import WAN_CONFIGS, MAX_AREA_CONFIGS
+from wan.src.wan.utils.utils import cache_video
+from wan.src.wan.utils.fm_solvers import FlowDPMSolverMultistepScheduler, get_sampling_sigmas, retrieve_timesteps
+from wan.src.wan.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
+from wan.src.wan.modules.model import sinusoidal_embedding_1d
 
 import runpod
-from runpod.serverless.utils.rp_validator import validate
 from runpod.serverless.utils.rp_download import file
 from runpod.serverless.modules.rp_logger import RunPodLogger
 
-from styles import STYLE_URLS, STYLE_NAMES  # ваши словари
+# --------------------------------------------------------------------------------
+# TeaCache patched forward (из TeaCache4Wan2.1, слегка упрощён)
+# --------------------------------------------------------------------------------
 
+def teacache_forward(self, x, t, context, seq_len, clip_fea=None, y=None):
+    """Заменяет исходный forward DiT, добавляя пропуски слоёв по TeaCache."""
+    device = self.patch_embedding.weight.device
+    if self.freqs.device != device:
+        self.freqs = self.freqs.to(device)
 
-# -------------------------------------------------------------
-#  Схема входных данных для валидации
-# -------------------------------------------------------------
+    # объединяем условный фрейм (y) с текущими скрытыми x
+    if y is not None:
+        x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
 
+    # Patch-embed
+    x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
+    grid_sizes = torch.stack([torch.tensor(u.shape[2:], dtype=torch.long) for u in x])
+    x = [u.flatten(2).transpose(1, 2) for u in x]
+    seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
+    x = torch.cat([
+        torch.cat([u, u.new_zeros(1, seq_len - u.size(1), u.size(2))], dim=1)
+        for u in x
+    ])
 
+    # Временные эмбеддинги
+    with amp.autocast(dtype=torch.float32):
+        e  = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, t).float())
+        e0 = self.time_projection(e).unflatten(1, (6, self.dim))
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
-model_id = "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers"
-cache = "./hf_cache"
-MODEL_FRAME_RATE = 16
+    # Текстовые эмбеддинги
+    context = self.text_embedding(torch.stack([
+        torch.cat([u, u.new_zeros(self.text_len - u.size(0), u.size(1))]) for u in context
+    ]))
 
-# Будем хранить текущий активный стиль и путь
-CURRENT_LORA_NAME = "./loras/wan_SmNmRmC.safetensors"
+    # Добавляем CLIP-фичи для I2V
+    if clip_fea is not None:
+        context = torch.cat([self.img_emb(clip_fea), context], dim=1)
 
+    kwargs = dict(
+        e=e0,
+        seq_lens=seq_lens,
+        grid_sizes=grid_sizes,
+        freqs=self.freqs,
+        context=context,
+        context_lens=None,
+    )
 
-def calculate_frames(duration, frame_rate):
-    raw_frames = round(duration * frame_rate)
-    nearest_multiple_of_4 = round(raw_frames / 4) * 4
-    return min(nearest_multiple_of_4 + 1, 81)
+    # --- TeaCache: решаем, вычислять блок или пропускать --------------------
+    mod_inp = e0 if self.use_ret_steps else e  # что сравниваем между шагами
+    even = (self.cnt % 2 == 0)
+    if even:
+        acc_attr, prev_attr, res_attr = 'acc_even', 'prev_e_even', 'res_even'
+    else:
+        acc_attr, prev_attr, res_attr = 'acc_odd', 'prev_e_odd', 'res_odd'
 
+    accumulated = getattr(self, acc_attr)
+    prev_e = getattr(self, prev_attr)
 
-class Predictor():
-    def setup(self):
-        """ 
-        Загружаем CLIPVisionModel, VAE и сам WanImageToVideoPipeline. 
-        Вызывается один раз перед первым predict.
-        """
-        try:
-            self.image_encoder = CLIPVisionModel.from_pretrained(
-                model_id,
-                subfolder="image_encoder",
-                cache_dir=cache,
-                torch_dtype=torch.float32
-            )
-            self.vae = AutoencoderKLWan.from_pretrained(
-                model_id, subfolder="vae",
-                cache_dir=cache,
-                torch_dtype=torch.float32
-            )
-            self.pipe = WanImageToVideoPipeline.from_pretrained(
-                model_id,
-                vae=self.vae,
-                cache_dir=cache,
-                image_encoder=self.image_encoder,
-                torch_dtype=torch.bfloat16
-            ).to(device)
-            self.pipe.enable_model_cpu_offload()
+    if self.cnt < self.ret_steps or self.cnt >= self.cutoff_steps:
+        compute = True
+        accumulated = 0.0
+    else:
+        poly = np.poly1d(self.coefficients)
+        accumulated += poly(((mod_inp - prev_e).abs().mean() / prev_e.abs().mean()).cpu().item())
+        compute = accumulated >= self.teacache_thresh
+        if compute:
+            accumulated = 0.0
+    setattr(self, acc_attr, accumulated)
+    setattr(self, prev_attr, mod_inp.clone())
 
-            self.vae_scale_factor_spatial  = self.pipe.vae_scale_factor_spatial
-            self.vae_scale_factor_temporal = self.pipe.vae_scale_factor_temporal
-            
-            # Загрузим LoRA по умолчанию, если он есть
-            self.pipe.load_lora_weights(CURRENT_LORA_NAME, multiplier=1.0)
-            print(f"Model loaded. VAE scales: spatial={self.vae_scale_factor_spatial}, temporal={self.vae_scale_factor_temporal}")
-        except Exception as e:
-            print("Error loading pipeline:", str(e))
-            raise RuntimeError(f"Failed to load pipeline: {str(e)}")
+    if compute:
+        ori = x.clone()
+        for block in self.blocks:
+            x = block(x, **kwargs)
+        setattr(self, res_attr, x - ori)
+    else:
+        x += getattr(self, res_attr)
 
-    def _get_local_lora_path(self, lora_style: str) -> str:
-        """
-        Сформировать локальный путь к файлу LoRA по ключу стиля:
-          - ищем в STYLE_NAMES имя файла,
-          - проверяем, лежит ли он в ./loras/,
-          - если нет — возвращаем None.
-        """
-        if not lora_style:
-            return None
+    # --- Head & unpatchify ---------------------------------------------------
+    x = self.head(x, e)
+    x = self.unpatchify(x, grid_sizes)
 
-        filename = STYLE_NAMES.get(lora_style)
-        if filename is None:
-            return None
+    self.cnt = (self.cnt + 1) % self.num_steps
+    return [u.float() for u in x]
 
-        # считаем, что локальные лоры лежат в папке ./loras/
-        local_path = os.path.join("./loras", filename)
-        if os.path.isfile(local_path):
-            return local_path
-        return None
+# --------------------------------------------------------------------------------
+# Custom generate for I2V – берём из примера Alibaba, только без ненужных опций
+# --------------------------------------------------------------------------------
 
-    def _download_lora_if_needed(self, lora_style: str) -> str:
-        """
-        Если у нас уже есть локально — вернём путь.
-        Если нет и есть ссылка в STYLE_URLS — скачиваем в ./loras/ и вернём путь.
-        """
-        # 1) Узнаём файл по ключу
-        filename = STYLE_NAMES.get(lora_style)
-        if filename is None:
-            raise RuntimeError(f"Unknown LORA style: {lora_style}")
+def i2v_generate(
+    self,                # WanI2V instance
+    prompt: str,
+    img: Image.Image,
+    *,
+    max_area: int,
+    frame_num: int,
+    shift: float,
+    sample_solver: Literal['unipc', 'dpm++'],
+    sampling_steps: int,
+    guide_scale: float,
+    n_prompt: str,
+    seed: int,
+    offload_model: bool = True,
+):
+    img_t = TF.to_tensor(img).sub_(0.5).div_(0.5).to(self.device)
+    F = frame_num
+    h, w = img_t.shape[1:]
+    ar = h / w
+    lat_h = round(math.sqrt(max_area * ar) // self.vae_stride[1] // self.patch_size[1] * self.patch_size[1])
+    lat_w = round(math.sqrt(max_area / ar) // self.vae_stride[2] // self.patch_size[2] * self.patch_size[2])
+    h, w = lat_h * self.vae_stride[1], lat_w * self.vae_stride[2]
 
-        target_dir = "./loras"
-        os.makedirs(target_dir, exist_ok=True)
-        local_path = os.path.join(target_dir, filename)
+    max_seq_len = int(math.ceil((((F - 1) // self.vae_stride[0] + 1) * lat_h * lat_w / (self.patch_size[1] * self.patch_size[2])) / self.sp_size)) * self.sp_size
 
-        # Если файл уже скачан — сразу возвращаем
-        if os.path.isfile(local_path):
-            return local_path
+    seed = seed if seed >= 0 else random.randint(0, 2 ** 31 - 1)
+    g = torch.Generator(device=self.device).manual_seed(seed)
 
-        # Иначе — скачиваем по URL
-        url = STYLE_URLS.get(lora_style)
-        if url is None:
-            raise RuntimeError(f"No URL found for LORA style: {lora_style}")
+    noise = torch.randn(
+        self.vae.model.z_dim,
+        (F - 1) // self.vae_stride[0] + 1,
+        lat_h,
+        lat_w,
+        dtype=torch.float32,
+        device=self.device,
+        generator=g,
+    )
 
-        print(f"Downloading LoRA '{lora_style}' from {url} into {local_path} ...")
-        # Если ссылка ведёт на HF «blob»-вид, нужно чуть подправить URL, чтобы его можно было прям скачать raw
-        if "huggingface.co" in url and "/blob/" in url:
-            url = url.replace("/blob/", "/resolve/")
-        resp = requests.get(url)
-        if resp.status_code != 200:
-            raise RuntimeError(f"Failed to download LORA from {url}: HTTP {resp.status_code}")
+    msk = torch.ones(1, F, lat_h, lat_w, device=self.device)
+    msk[:, 1:] = 0
+    msk = torch.cat([torch.repeat_interleave(msk[:, :1], repeats=4, dim=1), msk[:, 1:]], dim=1)
+    msk = msk.view(1, msk.shape[1] // 4, 4, lat_h, lat_w).transpose(1, 2)[0]
 
-        with open(local_path, "wb") as f:
-            f.write(resp.content)
+    if n_prompt == "":
+        n_prompt = self.sample_neg_prompt
 
-        print(f"Successfully saved LoRA to {local_path}")
-        return local_path
+    # --- текстовые и CLIP-контексты -----------------------------------------
+    if not self.t5_cpu:
+        self.text_encoder.model.to(self.device)
+        ctx = self.text_encoder([prompt], self.device)
+        ctx_null = self.text_encoder([n_prompt], self.device)
+        if offload_model:
+            self.text_encoder.model.cpu()
+    else:
+        ctx = self.text_encoder([prompt], torch.device('cpu'))
+        ctx_null = self.text_encoder([n_prompt], torch.device('cpu'))
+        ctx, ctx_null = [t.to(self.device) for t in ctx], [t.to(self.device) for t in ctx_null]
 
-    def load_lora(self, lora_style: str, lora_strength: float = 1.0):
-        """
-        Верхнеуровневая функция «установки» LoRA:
-          - Проверяем, меняется ли стиль (global CURRENT_LORA_STYLE).
-          - Если нет, то выходим (уже загружен нужный).
-          - Если да, то вызываем pipe.unload_lora_weights(), скачиваем/загружаем новую.
-        """
-        global CURRENT_LORA_NAME
+    self.clip.model.to(self.device)
+    clip_ctx = self.clip.visual([img_t[:, None, :, :]])
+    if offload_model:
+        self.clip.model.cpu()
 
-        # Если стиль не передан — ничего не делаем
-        if not lora_style:
-            return
+    y = self.vae.encode([
+        torch.cat([
+            TF.resize(img, (h, w)).transpose(0, 1),
+            torch.zeros(3, F - 1, h, w),
+        ], dim=1).to(self.device)
+    ])[0]
+    y = torch.cat([msk, y])
 
-        # Скачиваем (или берём локальный) нужный файл
-        local_path = self._download_lora_if_needed(lora_style)
+    @contextmanager
+    def no_sync():
+        yield
 
-         # Если стиль не поменялся — нет смысла перезагрузки
-        if CURRENT_LORA_NAME == local_path:
-            return
-
-        try:
-            self.pipe.unload_lora_weights()
-        except Exception:
-            # возможно, раньше pipe был без LoRA, пропускаем
-            pass
-        # Устанавливаем через diffusers
-        print(f"Loading LoRA weights from local_path = {local_path} (style={lora_style}, strength={lora_strength})")
-        self.pipe.load_lora_weights(local_path, multiplier=lora_strength)
-        print("LoRA applied.")
-
-        # Обновляем глобальное состояние
-        CURRENT_LORA_NAME = local_path
-
-    def set_fast_mode(self, fast_mode: str):
-        """
-        Переключает флаги ускорения в self.pipe в зависимости от fast_mode.
-        Поддерживаем 3 режима: "Off", "Balanced", "Fast".
-        """
-        # Всегда сначала сбрасываем все ускорения:
-        try:
-            self.pipe.disable_attention_slicing()
-        except Exception:
-            pass
-        try:
-            self.pipe.disable_vae_slicing()
-        except Exception:
-            pass
-        try:
-            self.pipe.disable_xformers_memory_efficient_attention()
-        except Exception:
-            pass
-
-        if fast_mode == "Off":
-            # Никаких оптимизаций: всё как есть
-            return
-
-        # --- Режим Balanced: включаем базовые слайсинги
-        if fast_mode == "Balanced":
-            try:
-                self.pipe.enable_attention_slicing()
-            except Exception:
-                pass
-            try:
-                self.pipe.enable_vae_slicing()
-            except Exception:
-                pass
-            return
-
-        # --- Режим Fast: включаем всё сразу (attention slicing + VAE slicing + xformers, если доступно)
-        if fast_mode == "Fast":
-            try:
-                self.pipe.enable_attention_slicing()
-            except Exception:
-                pass
-            try:
-                self.pipe.enable_vae_slicing()
-            except Exception:
-                pass
-            try:
-                self.pipe.enable_xformers_memory_efficient_attention()
-            except Exception:
-                pass
-            return
-
-        # Если передана неизвестная строка — оставляем Off
-        return
-
-    def predict(
-        self,
-        image: str,
-        prompt: str,
-        negative_prompt: str = "low quality, bad quality, blurry, pixelated, watermark",
-        lora_style: Optional[str] = None,
-        lora_strength: float = 1.0,
-        duration: float = 3.0,
-        fps: int = 16,
-        guidance_scale: float = 5.0,
-        num_inference_steps: int = 28,
-        resize_mode: str = "auto",
-        seed: Optional[int] = None,
-        fast_mode: str = "Balanced"
-    ) -> str:
-        """
-        Запускаем генерацию видео и возвращаем Base64.
-        """
-        # 1) Обновляем LoRA (если передан стиль)
-        if lora_style:
-            self.load_lora(lora_style, lora_strength)
-
-        # 2) Рассчитываем количество кадров
-        num_frames = calculate_frames(duration, MODEL_FRAME_RATE)
-
-        self.set_fast_mode(fast_mode)
-        # 3) Собираем генератор
-        if seed is not None:
-            torch.manual_seed(seed)
-            generator = torch.Generator(device=device).manual_seed(seed)
+    with amp.autocast(dtype=self.param_dtype), torch.no_grad(), no_sync():
+        if sample_solver == 'unipc':
+            sched = FlowUniPCMultistepScheduler(self.num_train_timesteps, shift=1, use_dynamic_shifting=False)
+            sched.set_timesteps(sampling_steps, device=self.device, shift=shift)
+            timesteps = sched.timesteps
         else:
-            seed = np.random.randint(0, 2**30)
-            generator = torch.Generator(device=device).manual_seed(seed)
+            sched = FlowDPMSolverMultistepScheduler(self.num_train_timesteps, shift=1, use_dynamic_shifting=False)
+            sigmas = get_sampling_sigmas(sampling_steps, shift)
+            timesteps, _ = retrieve_timesteps(sched, device=self.device, sigmas=sigmas)
 
-        # 4) Загружаем изображение
-        try:
-            input_image = load_image(str(image))
-        except Exception as e:
-            raise RuntimeError(f"Failed to load input image: {str(e)}")
+        latent = noise
+        arg_c   = {'context': [ctx[0]], 'clip_fea': clip_ctx, 'seq_len': max_seq_len, 'y': [y]}
+        arg_nil = {'context': ctx_null,  'clip_fea': clip_ctx, 'seq_len': max_seq_len, 'y': [y]}
 
-        # 5) Считаем размеры (аналогично ранее)
-        mod_value = self.vae_scale_factor_spatial * self.pipe.transformer.config.patch_size[1]
-        if resize_mode == "fixed_square":
-            width = height = 512
-        else:
-            if resize_mode == "auto":
-                aspect_ratio = input_image.height / input_image.width
-                if 0.9 <= aspect_ratio <= 1.1:
-                    width = height = 512
-                else:
-                    resize_mode = "keep_aspect_ratio"
-            if resize_mode == "keep_aspect_ratio":
-                max_area = 480 * 832
-                aspect_ratio = input_image.height / input_image.width
-                height = round(np.sqrt(max_area * aspect_ratio)) // mod_value * mod_value
-                width  = round(np.sqrt(max_area / aspect_ratio)) // mod_value * mod_value
+        if offload_model:
+            torch.cuda.empty_cache()
+        self.model.to(self.device)
+        for t in tqdm(timesteps, desc="sampling"):
+            li = [latent.to(self.device)]
+            ts = torch.stack([t]).to(self.device)
+            cond = self.model(li, t=ts, **arg_c)[0].to(torch.device('cpu') if offload_model else self.device)
+            if offload_model: torch.cuda.empty_cache()
+            uncond = self.model(li, t=ts, **arg_nil)[0].to(torch.device('cpu') if offload_model else self.device)
+            if offload_model: torch.cuda.empty_cache()
+            noise_pred = uncond + guide_scale * (cond - uncond)
+            latent = sched.step(noise_pred.unsqueeze(0), t, latent.unsqueeze(0), return_dict=False, generator=g)[0].squeeze(0)
 
-        # Гарантируем, что делится на 16
-        if height % 16 != 0 or width % 16 != 0:
-            height = (height // 16) * 16
-            width  = (width  // 16) * 16
+        if offload_model:
+            self.model.cpu(); torch.cuda.empty_cache()
+        video = self.vae.decode([latent.to(self.device)])[0]
 
-        input_image = input_image.resize((width, height))
+    if offload_model:
+        gc.collect(); torch.cuda.synchronize()
+    return video
 
-        # 6) Генерируем кадры
-        output = self.pipe(
-            image=input_image,
-            prompt=prompt,
-            negative_prompt=negative_prompt,
-            height=height,
-            width=width,
-            num_frames=num_frames,
-            guidance_scale=guidance_scale,
-            num_inference_steps=num_inference_steps,
-            generator=generator
-        ).frames[0]
+# --------------------------------------------------------------------------------
+# Presets quality → TeaCache params
+# --------------------------------------------------------------------------------
+QUALITY_PRESETS = {
+    "fast":   {"steps": 28, "thresh": 0.30, "use_ret": False},
+    "normal": {"steps": 40, "thresh": 0.15, "use_ret": False},
+    "best":   {"steps": 56, "thresh": 0.10, "use_ret": True},
+}
 
-        # 7) Сохраняем в MP4 и кодируем в Base64
-        local_video_path = tempfile.mkdtemp() + "/" + str(uuid.uuid4()) + ".mp4"
-        export_to_video(output, str(local_video_path), fps=fps)
+# --------------------------------------------------------------------------------
+# Predictor wrapper
+# --------------------------------------------------------------------------------
+DEVICE_ID = int(os.getenv("LOCAL_RANK", 0))
+CKPT_DIR = os.getenv("WAN_CKPT_DIR", "./models/Wan-AI/Wan2.1-I2V-14B-480P")
 
-        with open(local_video_path, "rb") as f:
-            video_bytes = f.read()
-        video_b64 = base64.b64encode(video_bytes).decode("utf-8")
-
-        os.remove(local_video_path)
-        return video_b64
-
-
-# -------------------------------------------------------------
-#  RunPod Handler
-# -------------------------------------------------------------
 logger = RunPodLogger()
 
-if torch.cuda.is_available():
-    print("Current CUDA device:", torch.cuda.current_device())
-    print("Device name:", torch.cuda.get_device_name(torch.cuda.current_device()))
-    predictor = Predictor()
-    predictor.setup()
+class Predictor:
+    def __init__(self):
+        cfg = WAN_CONFIGS["i2v-14B"]
+        self.pipe = wan.WanI2V(config=cfg, checkpoint_dir=CKPT_DIR, device_id=DEVICE_ID, rank=0)
+        # подвязываем кастомные функции один раз
+        self.pipe.__class__.generate = i2v_generate
+        self._apply_preset("normal")
+        logger.info("Wan2.1-I2V + TeaCache инициализирован.")
+
+    # ------------------ TeaCache preset patch --------------------------------
+    def _apply_preset(self, preset: str):
+        p = QUALITY_PRESETS[preset]
+        m = self.pipe.model.__class__  # type: ignore[attr-defined]
+        m.enable_teacache = True
+        m.forward = teacache_forward
+        m.cnt = 0
+        m.num_steps = p["steps"] * 2  # каждая итерация модальн.+немодальн.
+        m.teacache_thresh = p["thresh"]
+        m.use_ref_steps = p["use_ret"]
+        # служебные ресеты
+        m.acc_even = m.acc_odd = 0.0
+        m.prev_e_even = m.prev_e_odd = None
+        m.res_even = m.res_odd = None
+        if p["use_ret"]:
+            m.coefficients = [2.57151496e+05, -3.54229917e+04, 1.40286849e+03, -1.35890334e+01, 1.32517977e-01]
+            m.ret_steps = 10
+            m.cutoff_steps = m.num_steps
+        else:
+            m.coefficients = [-3.02331670e+02, 2.23948934e+02, -5.25463970e+01, 5.87348440e+00, -2.01973289e-01]
+            m.ret_steps = 2
+            m.cutoff_steps = m.num_steps - 2
+
+    # ------------------ inference -------------------------------------------
+    def __call__(
+        self,
+        *,
+        image_path: str,
+        prompt: str,
+        negative_prompt: str,
+        duration: float,
+        fps: int,
+        guidance: float,
+        preset: str,
+        seed: int | None,
+    ) -> str:
+        self._apply_preset(preset)
+        img = Image.open(image_path).convert("RGB")
+        base_seed = seed if seed is not None else random.randrange(2 ** 31)
+        frames = max(5, round(duration * fps / 4) * 4 + 1)  # 4n+1
+
+        video = self.pipe.generate(
+            prompt,
+            img,
+            max_area=MAX_AREA_CONFIGS["480*832"],
+            frame_num=frames,
+            shift=3.0,
+            sample_solver='unipc',
+            sampling_steps=QUALITY_PRESETS[preset]["steps"],
+            guide_scale=guidance,
+            n_prompt=negative_prompt,
+            seed=base_seed,
+            offload_model=True,
+        )
+
+        tmp = tempfile.mkdtemp()
+        out_path = os.path.join(tmp, f"{uuid.uuid4()}.mp4")
+        cache_video(video[None], save_file=out_path, fps=fps, nrow=1, normalize=True, value_range=(-1, 1))
+        with open(out_path, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode()
+        return b64
+
+# --------------------------------------------------------------------------------
+# RunPod handler
+# --------------------------------------------------------------------------------
+
+predictor: Predictor | None = None
 
 
 def handler(job):
     global predictor
     try:
-        payload = job.get("input", {})
         if predictor is None:
             predictor = Predictor()
-            predictor.setup()
 
-        # Скачиваем входное изображение
-        image_url = payload["image_url"]
-        image_obj = file(image_url)
-        image_path = image_obj["file_path"]
+        payload = job.get("input", {})
+        img_file = file(payload["image_url"])
 
-        prompt              = payload["prompt"]
-        negative_prompt     = payload.get("negative_prompt", "")
-        lora_style          = payload.get("lora_style", None)
-        lora_strength       = payload.get("lora_strength", 1.0)
-        duration            = payload.get("duration", 3.0)
-        fps                 = payload.get("fps", 16)
-        guidance_scale      = payload.get("guidance_scale", 5.0)
-        num_inference_steps = payload.get("num_inference_steps", 28)
-        resize_mode         = payload.get("resize_mode", "auto")
-        seed                = payload.get("seed", None)
-        fast_mode = payload.get("fast_mode", "Balanced")
-
-        video_b64 = predictor.predict(
-            image=image_path,
-            prompt=prompt,
-            negative_prompt=negative_prompt,
-            lora_style=lora_style,
-            lora_strength=lora_strength,
-            duration=duration,
-            fps=fps,
-            guidance_scale=guidance_scale,
-            num_inference_steps=num_inference_steps,
-            resize_mode=resize_mode,
-            seed=seed,
-            fast_mode=fast_mode
+        video_b64 = predictor(
+            image_path=img_file["file_path"],
+            prompt=payload["prompt"],
+            negative_prompt=payload.get("negative_prompt", "low quality, bad quality"),
+            duration=float(payload.get("duration", 3.0)),
+            fps=int(payload.get("fps", 16)),
+            guidance=float(payload.get("guidance_scale", 5.0)),
+            preset=payload.get("quality_preset", "normal"),
+            seed=payload.get("seed"),
         )
 
         return {"video_base64": video_b64}
 
     except Exception as e:
-        logger.error(f"An exception was raised: {e}")
-        return {
-            "error": str(e),
-            "output": traceback.format_exc(),
-            "refresh_worker": True
-        }
+        logger.error(f"Generation error: {e}")
+        return {"error": str(e), "output": traceback.format_exc(), "refresh_worker": True}
 
 
 if __name__ == "__main__":
     runpod.serverless.start({"handler": handler})
-
-
-
-
-
-#  0%|          | 0/28 [00:00<?, ?it/s]
-#   4%|▎         | 1/28 [00:16<07:22, 16.38s/it]
-#   7%|▋         | 2/28 [00:26<05:36, 12.95s/it]
-#  11%|█         | 3/28 [00:37<04:56, 11.86s/it]
-#  14%|█▍        | 4/28 [00:48<04:32, 11.35s/it]
-#  18%|█▊        | 5/28 [00:58<04:14, 11.08s/it]
-#  21%|██▏       | 6/28 [01:09<04:00, 10.92s/it]
-#  25%|██▌       | 7/28 [01:19<03:47, 10.82s/it]
-#  29%|██▊       | 8/28 [01:30<03:35, 10.76s/it]
-#  32%|███▏      | 9/28 [01:41<03:23, 10.72s/it]
-#  36%|███▌      | 10/28 [01:51<03:12, 10.69s/it]
-#  39%|███▉      | 11/28 [02:02<03:01, 10.68s/it]
-#  43%|████▎     | 12/28 [02:13<02:50, 10.66s/it]
-#  46%|████▋     | 13/28 [02:23<02:39, 10.65s/it]
-#  50%|█████     | 14/28 [02:34<02:29, 10.65s/it]
-#  54%|█████▎    | 15/28 [02:44<02:18, 10.64s/it]
-#  57%|█████▋    | 16/28 [02:55<02:07, 10.64s/it]
-#  61%|██████    | 17/28 [03:06<01:57, 10.64s/it]
-#  64%|██████▍   | 18/28 [03:16<01:46, 10.64s/it]
-#  68%|██████▊   | 19/28 [03:27<01:35, 10.64s/it]
-#  71%|███████▏  | 20/28 [03:38<01:25, 10.64s/it]
-#  75%|███████▌  | 21/28 [03:48<01:14, 10.64s/it]
-#  79%|███████▊  | 22/28 [03:59<01:03, 10.64s/it]
-#  82%|████████▏ | 23/28 [04:10<00:53, 10.64s/it]
-#  86%|████████▌ | 24/28 [04:20<00:42, 10.64s/it]
-#  89%|████████▉ | 25/28 [04:31<00:31, 10.64s/it]
-#  93%|█████████▎| 26/28 [04:41<00:21, 10.64s/it]
-#  96%|█████████▋| 27/28 [04:52<00:10, 10.63s/it]
-# 100%|██████████| 28/28 [05:03<00:00, 10.64s/it]
-# 100%|██████████| 28/28 [05:03<00:00, 10.83s/it]
