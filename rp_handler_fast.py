@@ -20,12 +20,12 @@ import torchvision.transforms.functional as TF
 import torch.cuda.amp as amp
 from tqdm import tqdm
 
-import wan
-from wan.src.wan.configs import WAN_CONFIGS, MAX_AREA_CONFIGS
-from wan.src.wan.utils.utils import cache_video
-from wan.src.wan.utils.fm_solvers import FlowDPMSolverMultistepScheduler, get_sampling_sigmas, retrieve_timesteps
-from wan.src.wan.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
-from wan.src.wan.modules.model import sinusoidal_embedding_1d
+import wan.wan as wan
+from wan.wan.configs import WAN_CONFIGS, MAX_AREA_CONFIGS
+from wan.wan.utils.utils import cache_video
+from wan.wan.utils.fm_solvers import FlowDPMSolverMultistepScheduler, get_sampling_sigmas, retrieve_timesteps
+from wan.wan.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
+from wan.wan.modules.model import sinusoidal_embedding_1d
 
 import runpod
 from runpod.serverless.utils.rp_download import file
@@ -230,6 +230,7 @@ def i2v_generate(
         gc.collect(); torch.cuda.synchronize()
     return video
 
+
 # --------------------------------------------------------------------------------
 # Presets quality → TeaCache params
 # --------------------------------------------------------------------------------
@@ -243,14 +244,18 @@ QUALITY_PRESETS = {
 # Predictor wrapper
 # --------------------------------------------------------------------------------
 DEVICE_ID = int(os.getenv("LOCAL_RANK", 0))
-CKPT_DIR = os.getenv("WAN_CKPT_DIR", "./models/Wan-AI/Wan2.1-I2V-14B-480P")
+CKPT_DIR = "./models/Wan-AI/Wan2.1-I2V-14B-480P"
 
 logger = RunPodLogger()
+
 
 class Predictor:
     def __init__(self):
         cfg = WAN_CONFIGS["i2v-14B"]
-        self.pipe = wan.WanI2V(config=cfg, checkpoint_dir=CKPT_DIR, device_id=DEVICE_ID, rank=0)
+        self.pipe = wan.WanI2V(config=cfg,
+                               checkpoint_dir=CKPT_DIR,
+                               device_id=DEVICE_ID,
+                               rank=0)
         # подвязываем кастомные функции один раз
         self.pipe.__class__.generate = i2v_generate
         self._apply_preset("normal")
@@ -291,6 +296,7 @@ class Predictor:
         guidance: float,
         preset: str,
         seed: int | None,
+        shift: float = 3.0,
     ) -> str:
         self._apply_preset(preset)
         img = Image.open(image_path).convert("RGB")
@@ -302,7 +308,7 @@ class Predictor:
             img,
             max_area=MAX_AREA_CONFIGS["480*832"],
             frame_num=frames,
-            shift=3.0,
+            shift=shift,
             sample_solver='unipc',
             sampling_steps=QUALITY_PRESETS[preset]["steps"],
             guide_scale=guidance,
@@ -321,6 +327,7 @@ class Predictor:
 # --------------------------------------------------------------------------------
 # RunPod handler
 # --------------------------------------------------------------------------------
+
 
 predictor: Predictor | None = None
 

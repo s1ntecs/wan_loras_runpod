@@ -14,14 +14,17 @@ from  styles import STYLE_URLS_UNIQUE
 
 model_id = "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers"
 
+
 def download_model():
     if not os.path.exists("./models"):
         os.makedirs("./models")
     print("Downloading model...")
     snapshot_download(
-        repo_id="Wan-AI/Wan2.1-I2V-14B-480P-Diffusers",
-        cache_dir="./hf_cache"
+        repo_id="Wan-AI/Wan2.1-I2V-14B-480P",   # без суффикса “-Diffusers”
+        local_dir="./models/Wan-AI/Wan2.1-I2V-14B-480P",
+        local_dir_use_symlinks=False
     )
+
 
 def download_wan():
     image_encoder = CLIPVisionModel.from_pretrained(
@@ -31,6 +34,7 @@ def download_wan():
     pipe = WanImageToVideoPipeline.from_pretrained(
         model_id, vae=vae, image_encoder=image_encoder, torch_dtype=torch.bfloat16
     )
+
 
 def download_loras():
     downloaded_paths = []
@@ -54,6 +58,6 @@ def download_loras():
 
 
 if __name__ == "__main__":
-    download_loras()
+    # download_loras()
     # download_wan() 
     download_model()
